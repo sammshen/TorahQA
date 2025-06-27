@@ -16,6 +16,10 @@ from typing import List, Dict, Any, Optional, Union
 import asyncio
 import random
 from pathlib import Path
+import re
+import threading
+import subprocess
+from io import StringIO
 
 # Set seeds for reproducibility
 RANDOM_SEED = 42
@@ -74,8 +78,8 @@ class BenchmarkConfig:
     num_documents_per_query: int
     qps: float
     duration: int
-    use_lmcache: bool
     seed: int
+    warmup_questions: int
     
     # Derived fields
     output_file: str = "benchmark_results.json"
@@ -94,18 +98,18 @@ def parse_arguments() -> BenchmarkConfig:
                        help="Model URL for tokenizer and inference")
     parser.add_argument("--document-chunk-size", type=int, default=512,
                        help="Document chunk size in tokens (default: 512)")
-    parser.add_argument("--num-documents-per-query", type=int, default=3,
-                       help="Number of documents to retrieve per query (default: 3)")
+    parser.add_argument("--num-documents-per-query", type=int, default=15,
+                       help="Number of documents to retrieve per query (default: 15)")
     parser.add_argument("--qps", type=float, default=4.0,
                        help="Queries per second (default: 4.0)")
-    parser.add_argument("--duration", type=int, default=30,
-                       help="Benchmarking duration in seconds (default: 30)")
-    parser.add_argument("--lmcache", action="store_true",
-                       help="Enable LMCache features")
+    parser.add_argument("--duration", type=int, default=120,
+                       help="Benchmarking duration in seconds (default: 120)")
     parser.add_argument("--output-file", type=str, default="benchmark_results.json",
                        help="Output file for results (default: benchmark_results.json)")
     parser.add_argument("--seed", type=int, default=42,
                        help="Random seed for reproducibility (default: 42)")
+    parser.add_argument("--warmup-questions", type=int, default=30,
+                       help="Number of questions to run during warmup phase (default: 30)")
     
     args = parser.parse_args()
     
@@ -128,8 +132,8 @@ def parse_arguments() -> BenchmarkConfig:
         num_documents_per_query=args.num_documents_per_query,
         qps=args.qps,
         duration=args.duration,
-        use_lmcache=args.lmcache,
         seed=args.seed,
+        warmup_questions=args.warmup_questions,
         output_file=args.output_file
     )
 
@@ -198,10 +202,14 @@ class User:
         os.environ["LMCACHE_BLEND_SPECIAL_STR"] = "# #"
         os.environ["LMCACHE_USE_LAYERWISE"] = "True"
         
-        if self.config.use_lmcache:
+        # Enable verbose logging for LMCache
+        os.environ["LMCACHE_LOGGING_LEVEL"] = "INFO"
+        os.environ["LMCACHE_VERBOSE"] = "True"
+        
+        if self.config.use_cacheblend:
             # Enable local CPU backend in LMCache
             os.environ["LMCACHE_LOCAL_CPU"] = "True"
-            os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "40"
+            os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "50"
         else:
             os.environ["LMCACHE_LOCAL_CPU"] = "False"
     
@@ -342,6 +350,10 @@ def create_rag_prompt(system_prompt: str, document_chunks: List[str], question: 
     Returns:
         str: Formatted prompt ready for LLM
     """
+    # Randomize document order to reduce prefix cache hits
+    randomized_chunks = document_chunks.copy()
+    random.shuffle(randomized_chunks)
+    
     # Encode components (removing BOS token with [1:])
     sys_tokens = tokenizer.encode(system_prompt)[1:]
     blend_tokens = tokenizer.encode(blend_special_str)[1:]
@@ -350,7 +362,7 @@ def create_rag_prompt(system_prompt: str, document_chunks: List[str], question: 
     # Build the prompt: sys_prompt + doc1 + ... + docN + question
     prompt_tokens = sys_tokens + blend_tokens
     
-    for chunk in document_chunks:
+    for chunk in randomized_chunks:
         chunk_tokens = tokenizer.encode(chunk)[1:]
         prompt_tokens.extend(chunk_tokens)
         prompt_tokens.extend(blend_tokens)
@@ -360,6 +372,68 @@ def create_rag_prompt(system_prompt: str, document_chunks: List[str], question: 
     
     # Decode back to string
     return tokenizer.decode(prompt_tokens, skip_special_tokens=True)
+
+
+async def run_warmup(user, vector_db, all_questions, config, system_prompt) -> int:
+    """
+    Run warm-up phase to prime caches and prepare the system.
+    
+    Args:
+        user: User object for generation
+        vector_db: Vector database for document retrieval
+        all_questions: List of all available questions
+        config: Benchmark configuration
+        system_prompt: System prompt to use
+        
+    Returns:
+        int: Number of warmup requests completed
+    """
+    print(f"\n🔥 WARMUP PHASE: Running {config.warmup_questions} questions...")
+    
+    warmup_count = 0
+    warmup_start = time.time()
+    
+    try:
+        for i in range(config.warmup_questions):
+            # Randomly select a question for warmup
+            qa_pair = random.choice(all_questions)
+            question = qa_pair["question"]
+            
+            print(f"   Warmup {i+1}/{config.warmup_questions}: {question[:40]}...")
+            
+            # Query vector database (same as benchmark)
+            search_results = vector_db.query(question, top_k=config.num_documents_per_query)
+            
+            if not search_results:
+                print(f"   Warning: No documents found for warmup question")
+                continue
+            
+            # Extract document chunks
+            document_chunks = [result[0] for result in search_results]
+            
+            # Create RAG prompt (same as benchmark)
+            prompt = create_rag_prompt(
+                system_prompt=system_prompt,
+                document_chunks=document_chunks,
+                question=question,
+                tokenizer=user.tokenizer
+            )
+            
+            # Generate response (no timing during warmup)
+            user.generate(prompt)
+            warmup_count += 1
+            
+            # Small delay to avoid overwhelming
+            await asyncio.sleep(0.1)
+    
+    except Exception as e:
+        print(f"   Error during warmup: {e}")
+    
+    warmup_time = time.time() - warmup_start
+    print(f"   ✓ Warmup completed: {warmup_count} requests in {warmup_time:.2f}s")
+    print(f"   ✓ System primed and ready for benchmark")
+    
+    return warmup_count
 
 
 async def run_benchmark(config: BenchmarkConfig) -> Dict[str, Any]:
@@ -405,7 +479,14 @@ async def run_benchmark(config: BenchmarkConfig) -> Dict[str, Any]:
     # 5. System prompt (never changes)
     system_prompt = "You are a helpful assistant that answers questions about the Torah based on the provided context. Please provide accurate and concise answers."
     
-    # 6. Run benchmark
+    # 6. Run warmup phase
+    if config.warmup_questions > 0:
+        warmup_count = await run_warmup(user, vector_db, all_questions, config, system_prompt)
+    else:
+        print(f"\n🔥 WARMUP PHASE: Skipped (warmup-questions=0)")
+        warmup_count = 0
+    
+    # 7. Run benchmark
     print(f"\n5. Running benchmark for {config.duration} seconds...")
     responses = []
     start_time = time.time()
@@ -474,11 +555,11 @@ async def run_benchmark(config: BenchmarkConfig) -> Dict[str, Any]:
         print(f"\n   Error during benchmark: {e}")
     
     finally:
-        # 7. Cleanup
+        # 8. Cleanup
         print(f"\n6. Cleaning up...")
         user.cleanup()
     
-    # 8. Generate results summary
+    # 9. Generate results summary
     total_time = time.time() - start_time
     print(f"\n7. Generating results summary...")
     print(f"   Total requests: {len(responses)}")
@@ -571,7 +652,8 @@ async def run_benchmark(config: BenchmarkConfig) -> Dict[str, Any]:
         "config": asdict(config),
         "summary": summary_stats,
         "responses": [asdict(r) for r in responses],
-        "detailed_stats": df_dict  # Include pandas DataFrame data
+        "detailed_stats": df_dict,  # Include pandas DataFrame data
+        "warmup_count": warmup_count  # Include warmup information
     }
     
     # Save results to file
@@ -592,13 +674,14 @@ def main():
     try:
         results = asyncio.run(run_benchmark(config))
         print(f"\nBenchmark Summary:")
+        print(f"  Warmup Requests: {results['warmup_count']}")
         print(f"  Total Requests: {results['summary']['total_requests']}")
         print(f"  Actual QPS: {results['summary']['actual_qps']:.2f}")
         
         if 'generation_time' in results['summary']:
             gen_stats = results['summary']['generation_time']
             sim_stats = results['summary']['similarity_score']
-            print(f"  Generation Time: {gen_stats['mean']:.3f}s (±{gen_stats['std']:.3f}s)")
+            print(f"  AVERAGE Generation Time: {gen_stats['mean']:.3f}s (±{gen_stats['std']:.3f}s)")
             print(f"  Similarity Score: {sim_stats['mean']:.4f} (±{sim_stats['std']:.4f})")
         else:
             print("  No statistics available (no responses generated)")
