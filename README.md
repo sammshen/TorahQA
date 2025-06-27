@@ -70,7 +70,7 @@ python rag.py --cacheblend --model-url "mistralai/Mistral-7B-Instruct-v0.2" \
 - **System Metrics**: Actual QPS achieved, total requests processed, warmup phase statistics
 - **Detailed Analytics**: Pandas DataFrame with per-request metrics for further analysis
 
-## Example Results (on H100 80GB) with example above:
+## Example Results (on A100 40GB) with example above:
 
 ### Huge decrease in generation time with minimal loss in accuracy
 
