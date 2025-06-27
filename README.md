@@ -1,4 +1,4 @@
-# Jewish RAG Benchmarking
+# RAG Benchmarking
 
 Benchmarks RAG performance using CacheBlend or OpenAI API with Torah QA data.
 
@@ -45,42 +45,19 @@ python rag.py --cacheblend --model-url "mistralai/Mistral-7B-Instruct-v0.2" \
 
 ## Features
 
-- Unified interface for CacheBlend and OpenAI API backends
-- Token-based document chunking with precise control
-- QPS-controlled benchmarking with reproducible results (seeded)
-- **Warm-up phase**: Primes caches before benchmarking for accurate measurements
-- Comprehensive pandas-based statistical analysis
-- **FAISS vector search with TF-IDF embeddings**:
-  - **Document Processing**: Automatically loads all `.txt` files from `torah-cqa/contexts/`
-  - **Smart Chunking**: Documents are split using token-based chunking (with provided tokenizer) or character-based chunking, with sentence boundary detection to avoid breaking mid-sentence
-  - **TF-IDF Vectorization**: Uses scikit-learn's `TfidfVectorizer` with unigrams and bigrams, English stop words removal, and configurable max features (default: 10,000)
-  - **FAISS Indexing**: Employs `IndexFlatIP` (Inner Product) for fast cosine similarity search after L2 normalization
-  - **Singleton Pattern**: Database is built once and reused across all queries for efficiency
-  - **Retrieval**: For each question, returns top-k most semantically similar document chunks with similarity scores
-  - **Integration**: Retrieved chunks are automatically formatted into RAG prompts using the CacheBlend-compatible format with special separators
+- **Unified backends**: CacheBlend (vLLM + LMCache) and OpenAI API compatibility
+- **Smart document retrieval**: FAISS vector search with TF-IDF embeddings, token-based chunking, and sentence boundary detection
+- **Realistic RAG simulation**: Document randomization, QPS control, and warm-up phase
+- **Comprehensive analysis**: Pandas-based statistics with generation times, similarity scores, and detailed metrics
 
-## RAG Pipeline Workflow
+## How It Works
 
-**End-to-End Process for Each Question:**
-
-1. **Question Selection**: Randomly selects a question from `torah-cqa/qas/` JSON files
-2. **Document Retrieval**: 
-   - Vectorizes the question using the same TF-IDF model used for documents
-   - Performs cosine similarity search against the FAISS index
-   - Returns top-k most relevant document chunks (default: 15 chunks)
-   - Each chunk includes similarity score and metadata (source file, position)
-3. **Prompt Construction**:
-   - **System Prompt**: Fixed instructional text for consistent behavior
-   - **Document Randomization**: Shuffles retrieved chunks to reduce prefix rigidity and match real world RAG more closely
-   - **Token Encoding**: Uses model tokenizer to encode each component separately
-   - **CacheBlend Format**: Assembles prompt as: `system + sep + doc1 + sep + doc2 + ... + sep + question`
-   - **Special Separators**: Uses `"# #"` tokens between components for cache blending
-4. **LLM Generation**:
-   - **CacheBlend Mode**: Uses vLLM with KV cache transfer and layerwise blending
-   - **OpenAI Mode**: Standard completions API with temperature=0 for deterministic results
-   - **Generation Parameters**: Fixed seed, controlled max tokens, deterministic sampling
-5. **Response Collection**: Records generation time, answer text, and retrieval metadata
-6. **Statistical Analysis**: Pandas-based analysis of generation times, similarity scores, and answer lengths
+1. **Loads** Torah documents and QA pairs from `torah-cqa/`
+2. **Builds** FAISS index with TF-IDF embeddings for semantic search  
+3. **Retrieves** top-k relevant chunks for each question
+4. **Constructs** prompts with system text + shuffled documents + question using `"# #"` separators
+5. **Generates** answers with controlled QPS and deterministic parameters
+6. **Analyzes** performance with comprehensive statistics
 
 ## Data & Output
 
